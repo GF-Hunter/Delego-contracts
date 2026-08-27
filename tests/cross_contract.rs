@@ -1,11 +1,13 @@
 #![cfg(test)]
 
-use delego_escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
-use delego_permissions::{PermissionsContract, PermissionsContractClient};
+use delego_escrow::{BatchDepositParams, EscrowContract, EscrowContractClient, EscrowStatus};
+use delego_permissions::{
+    PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
+};
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
 };
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, Vec};
 
 struct TestEnv {
     env: Env,
@@ -80,6 +82,32 @@ fn delegated_deposit(t: &TestEnv, amount: i128, timeout_ledgers: u32) -> u64 {
         &None,
     )
 }
+
+/// Attempts a delegated purchase: checks permissions and executes spend, then buyer deposits into escrow.
+fn try_delegated_deposit(
+    t: &TestEnv,
+    amount: i128,
+    timeout_ledgers: u32,
+) -> Result<u64, PermissionError> {
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    match perm_client.try_execute_spend(&t.buyer, &t.agent, &amount, &t.seller) {
+        Ok(Ok(())) => Ok(escrow_client.deposit(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &amount,
+            &t.order_id(),
+            &timeout_ledgers,
+            &None,
+            &None,
+        )),
+        Err(Ok(e)) => Err(e),
+        _ => Err(PermissionError::Unauthorized),
+    }
+}
+
 
 #[test]
 fn test_permission_checked_before_escrow_fund_fails_without_permission() {
@@ -250,3 +278,306 @@ fn test_reputation_recorded_after_escrow_release() {
     let breakdown = reputation_client.get_reputation_breakdown(&t.seller, &0u32, &10u32);
     assert_eq!(breakdown.get(0).unwrap().rating, Some(9500u32));
 }
+
+#[test]
+fn test_permission_revoked_after_spend_before_escrow_deposit_fails() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Arrange: Grant permission with sufficient allowance.
+    let limit_total = 1000i128;
+    let limit_per_tx = 500i128;
+    let ttl_ledgers = 36000u32;
+    let merchants = Vec::<Address>::new(&t.env);
+
+    perm_client.grant(
+        &t.buyer,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &ttl_ledgers,
+    );
+
+    // Act 1: Agent executes spend within limits.
+    perm_client.execute_spend(&t.buyer, &t.agent, &300, &t.seller);
+    let perm_record = perm_client.get_permission(&t.buyer, &t.agent);
+    assert_eq!(perm_record.spent, 300);
+
+    // Act 2: Owner revokes the permission before escrow deposit.
+    perm_client.revoke(&t.buyer, &t.agent);
+
+    // Assert: Permission is no longer active and subsequent spend/deposit fails.
+    assert!(!perm_client.is_active(&t.buyer, &t.agent));
+    let revoked_record = perm_client.get_permission(&t.buyer, &t.agent);
+    assert_eq!(revoked_record.status, PermissionStatus::Revoked);
+
+    let spend_result = perm_client.try_execute_spend(&t.buyer, &t.agent, &200, &t.seller);
+    assert_eq!(spend_result, Err(Ok(PermissionError::Unauthorized)));
+
+    let deposit_result = try_delegated_deposit(&t, 200, 3600);
+    assert_eq!(deposit_result, Err(PermissionError::Unauthorized));
+
+    assert!(escrow_client.try_get_escrow(&1).is_err());
+}
+
+#[test]
+fn test_permission_paused_during_flow() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Arrange: Grant permission and execute first spend + deposit successfully.
+    let limit_total = 1000i128;
+    let limit_per_tx = 500i128;
+    let ttl_ledgers = 36000u32;
+    let merchants = Vec::<Address>::new(&t.env);
+
+    perm_client.grant(
+        &t.buyer,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &ttl_ledgers,
+    );
+
+    let escrow_id_1 = delegated_deposit(&t, 200, 3600);
+    assert_eq!(escrow_id_1, 1);
+    let perm_1 = perm_client.get_permission(&t.buyer, &t.agent);
+    assert_eq!(perm_1.spent, 200);
+
+    // Act 1: Pause the permission mid-flow.
+    perm_client.pause(&t.buyer, &t.agent);
+
+    // Assert 1: Permission is paused and subsequent spends fail.
+    assert!(!perm_client.is_active(&t.buyer, &t.agent));
+    let paused_record = perm_client.get_permission(&t.buyer, &t.agent);
+    assert_eq!(paused_record.status, PermissionStatus::Paused);
+
+    let spend_result = perm_client.try_execute_spend(&t.buyer, &t.agent, &200, &t.seller);
+    assert_eq!(spend_result, Err(Ok(PermissionError::PermissionPaused)));
+
+    let deposit_result = try_delegated_deposit(&t, 200, 3600);
+    assert_eq!(deposit_result, Err(PermissionError::PermissionPaused));
+
+    // Act 2: Resume the permission.
+    perm_client.resume(&t.buyer, &t.agent);
+
+    // Assert 2: Permission is active again and spend/deposit succeeds.
+    assert!(perm_client.is_active(&t.buyer, &t.agent));
+    let resumed_record = perm_client.get_permission(&t.buyer, &t.agent);
+    assert_eq!(resumed_record.status, PermissionStatus::Active);
+
+    let escrow_id_2 = delegated_deposit(&t, 200, 3600);
+    assert_eq!(escrow_id_2, 2);
+    let escrow_record_2 = escrow_client.get_escrow(&escrow_id_2);
+    assert_eq!(escrow_record_2.amount, 200);
+
+    let perm_final = perm_client.get_permission(&t.buyer, &t.agent);
+    assert_eq!(perm_final.spent, 400);
+}
+
+#[test]
+fn test_merchant_restriction_enforcement() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Arrange: Whitelist only seller A.
+    let seller_a = t.seller.clone();
+    let seller_b = Address::generate(&t.env);
+
+    let limit_total = 1000i128;
+    let limit_per_tx = 500i128;
+    let ttl_ledgers = 36000u32;
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(seller_a.clone());
+
+    perm_client.grant(
+        &t.buyer,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &ttl_ledgers,
+    );
+
+    // Act & Assert 1: Attempt spend/deposit to unwhitelisted seller B fails.
+    let spend_result = perm_client.try_execute_spend(&t.buyer, &t.agent, &200, &seller_b);
+    assert_eq!(spend_result, Err(Ok(PermissionError::MerchantNotAllowed)));
+
+    let can_spend_result = perm_client.try_can_spend(&t.buyer, &t.agent, &200, &seller_b);
+    assert_eq!(can_spend_result, Err(Ok(PermissionError::MerchantNotAllowed)));
+
+    // Act & Assert 2: Deposit to allowed seller A succeeds.
+    let escrow_id = delegated_deposit(&t, 200, 3600);
+    assert_eq!(escrow_id, 1);
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.amount, 200);
+    assert_eq!(record.seller, seller_a);
+
+    let perm = perm_client.get_permission(&t.buyer, &t.agent);
+    assert_eq!(perm.spent, 200);
+}
+
+#[test]
+fn test_batch_operations_across_contracts() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    // Arrange: Grant permission with high total limit.
+    let limit_total = 5000i128;
+    let limit_per_tx = 2000i128;
+    let ttl_ledgers = 36000u32;
+    let merchants = Vec::<Address>::new(&t.env);
+
+    perm_client.grant(
+        &t.buyer,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &ttl_ledgers,
+    );
+
+    let amounts = [300i128, 400i128, 500i128];
+    let total_spent: i128 = 1200;
+
+    // Act 1: Execute multiple spends across contracts.
+    for &amount in amounts.iter() {
+        perm_client.execute_spend(&t.buyer, &t.agent, &amount, &t.seller);
+    }
+
+    // Verify cumulative allowance is correctly decremented.
+    let perm = perm_client.get_permission(&t.buyer, &t.agent);
+    assert_eq!(perm.spent, total_spent);
+    assert_eq!(perm.limit_total - perm.spent, 3800);
+
+    // Act 2: Use batch_deposit to create several escrows corresponding to the spends.
+    let mut orders = Vec::new(&t.env);
+    for (i, &amount) in amounts.iter().enumerate() {
+        let order_id = BytesN::from_array(&t.env, &[(i as u8) + 1; 32]);
+        orders.push_back(BatchDepositParams {
+            seller: t.seller.clone(),
+            token: t.token_contract_id.clone(),
+            amount,
+            order_id,
+            timeout_ledgers: 3600,
+            order_hash: None,
+            schema: None,
+        });
+    }
+
+    let escrow_ids = escrow_client.batch_deposit(&t.buyer, &orders);
+
+    // Assert: Verify all escrows were created with correct amounts and balances updated.
+    assert_eq!(escrow_ids.len(), 3);
+    assert_eq!(escrow_ids.get(0).unwrap(), 1);
+    assert_eq!(escrow_ids.get(1).unwrap(), 2);
+    assert_eq!(escrow_ids.get(2).unwrap(), 3);
+
+    assert_eq!(escrow_client.get_escrow(&1).amount, 300);
+    assert_eq!(escrow_client.get_escrow(&2).amount, 400);
+    assert_eq!(escrow_client.get_escrow(&3).amount, 500);
+
+    assert_eq!(token_client.balance(&t.buyer), 10000 - total_spent);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), total_spent);
+}
+
+#[test]
+fn test_partial_release_reduces_escrow_state_correctly() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    // Arrange: Grant permission and deposit 500 into escrow.
+    let limit_total = 1000i128;
+    let limit_per_tx = 1000i128;
+    let ttl_ledgers = 36000u32;
+    let merchants = Vec::<Address>::new(&t.env);
+
+    perm_client.grant(
+        &t.buyer,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &ttl_ledgers,
+    );
+
+    let escrow_id = delegated_deposit(&t, 500, 3600);
+    assert_eq!(escrow_id, 1);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 500);
+    assert_eq!(token_client.balance(&t.seller), 0);
+
+    // Act: Partial-release 200 to the seller.
+    let result = escrow_client.partial_release(&escrow_id, &t.buyer, &200);
+
+    // Assert: PartialReleaseResult reflects the partial release.
+    assert_eq!(result.released, 200);
+    assert_eq!(result.remaining, 300);
+    assert!(!result.fully_released);
+
+    // Verify the stored escrow record shows released_amount = 200, remaining balance = 300, and active status.
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.released_amount, 200);
+    assert_eq!(record.amount - record.released_amount, 300);
+    assert_eq!(record.status, EscrowStatus::Funded);
+
+    // Verify token transfers: seller received 200, escrow contract retains 300.
+    assert_eq!(token_client.balance(&t.seller), 200);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 300);
+}
+
+#[test]
+fn test_permission_expiry_between_grant_and_spend() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    // Arrange: Grant permission with a very short TTL.
+    let limit_total = 1000i128;
+    let limit_per_tx = 500i128;
+    let ttl_ledgers = 10u32;
+    let merchants = Vec::<Address>::new(&t.env);
+
+    perm_client.grant(
+        &t.buyer,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &ttl_ledgers,
+    );
+
+    // Permission is active before expiration.
+    assert!(perm_client.is_active(&t.buyer, &t.agent));
+    assert_eq!(
+        perm_client.try_can_spend(&t.buyer, &t.agent, &200, &t.seller),
+        Ok(Ok(()))
+    );
+
+    // Act: Advance the ledger sequence past the expiry.
+    let current_seq = t.env.ledger().sequence();
+    t.env.ledger().with_mut(|li| {
+        li.sequence_number = current_seq + ttl_ledgers + 1;
+    });
+
+    // Assert: Permission is no longer active, and spend attempt fails with Expired.
+    assert!(!perm_client.is_active(&t.buyer, &t.agent));
+
+    let spend_result = perm_client.try_execute_spend(&t.buyer, &t.agent, &200, &t.seller);
+    assert_eq!(spend_result, Err(Ok(PermissionError::Expired)));
+
+    let can_spend_result = perm_client.try_can_spend(&t.buyer, &t.agent, &200, &t.seller);
+    assert_eq!(can_spend_result, Err(Ok(PermissionError::Expired)));
+
+    let deposit_result = try_delegated_deposit(&t, 200, 3600);
+    assert_eq!(deposit_result, Err(PermissionError::Expired));
+}
+
